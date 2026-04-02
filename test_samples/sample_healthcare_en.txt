@@ -1,0 +1,8 @@
+Patient Record — Confidential
+Patient: John Smith
+Email: john.smith@hospital.org
+Phone: 555-867-5309
+SSN: 123-45-6789
+Billing Provider NPI: 1234567893
+Location: 123 Main Street, New York, NY 10001
+Credit Card: 4532015112830366

@@ -1,0 +1,22 @@
+# Credentials & Secrets
+credentials/
+*.json
+!.env.example
+.env
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Reports (may contain sensitive data)
+reports/
+
+# IDE
+.vscode/
+.idea/
