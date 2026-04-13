@@ -38,6 +38,18 @@ from sheets_reporter import write_to_sheets
 
 logger = logging.getLogger("scanner.main")
 
+BASE_DIR = Path(__file__).parent.absolute()
+LOCK_FILE = str(BASE_DIR / ".scan_lock")
+
+def update_lock_status(status: str, detail: str = ""):
+    """Update the lock file with a status suffix like PID:STATUS:DETAIL"""
+    try:
+        pid = os.getpid()
+        with open(LOCK_FILE, "w") as f:
+            f.write(f"{pid}:{status}:{detail}")
+    except Exception:
+        pass
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Local Test Mode — Scan files on disk without Google Drive
@@ -57,7 +69,7 @@ def run_local_test(engine: ScannerEngine, config: ScannerConfig) -> List[FileSca
     results = []
     sample_files = list(samples_dir.glob("*"))
 
-    logger.info(f"🧪 Local test mode: scanning {len(sample_files)} file(s) in '{samples_dir}/'")
+    logger.info(f"Local test mode: scanning {len(sample_files)} file(s) in '{samples_dir}/'")
 
     for filepath in sample_files:
         try:
@@ -79,6 +91,7 @@ def run_local_test(engine: ScannerEngine, config: ScannerConfig) -> List[FileSca
                 file_id=f"local_{filepath.stem}",
                 file_name=filepath.name,
                 file_path=str(filepath),
+                owner="local-system",
                 mime_type=mime,
                 modified_time="",
                 total_chars=len(text),
@@ -86,11 +99,12 @@ def run_local_test(engine: ScannerEngine, config: ScannerConfig) -> List[FileSca
             ))
 
         except Exception as e:
-            logger.error(f"❌ Local test error for '{filepath.name}': {e}")
+            logger.error(f"Error: Local test error for '{filepath.name}': {e}")
             results.append(FileScanResult(
                 file_id=f"local_{filepath.stem}",
                 file_name=filepath.name,
                 file_path=str(filepath),
+                owner="local-system",
                 mime_type="text/plain",
                 modified_time="",
                 error=str(e),
@@ -163,6 +177,7 @@ def process_file(
         file_id=drive_file.file_id,
         file_name=drive_file.name,
         file_path=drive_file.path,
+        owner=drive_file.owner,
         mime_type=drive_file.mime_type,
         modified_time=drive_file.modified_time,
     )
@@ -187,11 +202,11 @@ def process_file(
 
     except MemoryError:
         result.error = "File too large for available memory"
-        logger.error(f"💾 Memory error processing '{drive_file.name}' ({drive_file.size:,} bytes)")
+        logger.error(f"Memory error processing '{drive_file.name}' ({drive_file.size:,} bytes)")
 
     except Exception as e:
         result.error = str(e)
-        logger.error(f"❌ Unexpected error for '{drive_file.name}': {e}")
+        logger.error(f"Error: Unexpected error for '{drive_file.name}': {e}")
 
     return result
 
@@ -225,12 +240,12 @@ def run_scan(args: argparse.Namespace) -> int:
     try:
         engine.initialize()
     except Exception as e:
-        logger.error(f"❌ Engine initialization failed: {e}")
+        logger.error(f"Error: Engine initialization failed: {e}")
         return 1
 
     # ── 3. Local Test Mode ────────────────────────────────────────────────────
     if args.local_test:
-        logger.info("🧪 Running in LOCAL TEST mode (no Google Drive connection)")
+        logger.info("Running in LOCAL TEST mode (no Google Drive connection)")
         results = run_local_test(engine, config)
         duration = time.time() - start_time
 
@@ -262,25 +277,61 @@ def run_scan(args: argparse.Namespace) -> int:
     drive_client = DriveClient(config.auth, rate_limiter)
     if not drive_client.authenticate():
         logger.error(
-            "❌ Authentication failed.\n"
+            "Error: Authentication failed.\n"
             "   Please ensure credentials/client_secret.json exists.\n"
             "   See README.md for setup instructions."
         )
         return 1
 
     # ── 5. List Files ─────────────────────────────────────────────────────────
+    drive_files: List[DriveFile] = []
     try:
-        drive_files = drive_client.list_files(config.scan)
+        if config.scan.scan_all_users:
+            logger.info("SCAN_ALL_USERS is enabled. Discovering files across all domain users...")
+            users = drive_client.list_all_users()
+            if not users:
+                logger.warning("Directory API returned no users or failed. Falling back to primary user scan.")
+                if config.auth.impersonate_user_email:
+                    users = [config.auth.impersonate_user_email]
+                else:
+                    # If everything else fails, we'll hit the 'if not drive_files' check below
+                    users = []
+            
+            total_users = len(users)
+            for idx, user_email in enumerate(users, 1):
+                update_lock_status("INDEXING", f"User ({idx}/{total_users}): {user_email}")
+                # Switch impersonation target
+                if drive_client.authenticate(impersonate_email=user_email):
+                    try:
+                        user_files = drive_client.list_files(config.scan, lambda d: update_lock_status("INDEXING", d))
+                        drive_files.extend(user_files)
+                    except Exception as ue:
+                        logger.error(f"Failed to list files for {user_email}: {ue}")
+                else:
+                    logger.error(f"Error: Failed to impersonate {user_email}")
+            
+            # Deduplicate by file_id (files might be shared across users)
+            seen_ids = set()
+            unique_files = []
+            for f in drive_files:
+                if f.file_id not in seen_ids:
+                    unique_files.append(f)
+                    seen_ids.add(f.file_id)
+            drive_files = unique_files
+            logger.info(f"Total unique files discovered across domain: {len(drive_files)}")
+        else:
+            update_lock_status("INDEXING", "Discovering files in Drive...")
+            drive_files = drive_client.list_files(config.scan, lambda d: update_lock_status("INDEXING", d))
     except Exception as e:
-        logger.error(f"❌ Failed to list Drive files: {e}")
+        logger.error(f"Error: Failed to list Drive files: {e}")
         return 1
 
     if not drive_files:
-        logger.info("ℹ️  No scannable files found. Check folder ID and file types.")
+        logger.info("Info: No scannable files found. Check folder ID and file types.")
         return 0
 
     # ── 6. Process Files (Parallel) ───────────────────────────────────────────
-    CACHE_FILE = "scan_cache.json"
+    CACHE_FILE = str(BASE_DIR / "scan_cache.json")
     scan_cache = {}
     if Path(CACHE_FILE).exists():
         import json
@@ -288,7 +339,7 @@ def run_scan(args: argparse.Namespace) -> int:
             with open(CACHE_FILE, "r", encoding="utf-8") as cf:
                 scan_cache = json.load(cf)
         except Exception as ce:
-            logger.warning(f"⚠️ Failed to read cache file: {ce}")
+            logger.warning(f"Failed to read cache file: {ce}")
 
     results: List[FileScanResult] = []
     files_to_scan = []
@@ -302,6 +353,7 @@ def run_scan(args: argparse.Namespace) -> int:
                 file_id=f.file_id,
                 file_name=f.name,
                 file_path=f.path,
+                owner=f.owner,
                 mime_type=f.mime_type,
                 modified_time=f.modified_time,
                 total_chars=cached.get("total_chars", 0),
@@ -311,7 +363,7 @@ def run_scan(args: argparse.Namespace) -> int:
         else:
             files_to_scan.append(f)
 
-    logger.info(f"\n🚀 Starting parallel scan of {len(files_to_scan)} file(s) (Skipped {len(drive_files) - len(files_to_scan)} cached)...")
+    logger.info(f"\nStarting parallel scan of {len(files_to_scan)} file(s) (Skipped {len(drive_files) - len(files_to_scan)} cached)...")
     logger.info(f"   Workers: {config.scan.max_workers}")
 
     import json
@@ -324,7 +376,7 @@ def run_scan(args: argparse.Namespace) -> int:
 
         skip_count = len(drive_files) - len(files_to_scan)
         with tqdm(total=len(drive_files), initial=skip_count, unit="file", desc="Scanning") as pbar:
-            for future in as_completed(future_map):
+            for i, future in enumerate(as_completed(future_map), 1):
                 drive_file = future_map[future]
                 try:
                     result = future.result()
@@ -337,16 +389,22 @@ def run_scan(args: argparse.Namespace) -> int:
                         "findings": [asdict(fi) for fi in result.findings],
                         "error": result.error
                     }
+                    
+                    # Periodic UI status update
+                    if (i + skip_count) % 10 == 0 or i == len(files_to_scan):
+                        update_lock_status("SCANNING", f"{i + skip_count}/{len(drive_files)}")
+
                     # Checkpoint cache to disk
                     with open(CACHE_FILE, "w", encoding="utf-8") as cf:
                         json.dump(scan_cache, cf, ensure_ascii=False)
                         
                 except Exception as e:
-                    logger.error(f"❌ Unhandled error for '{drive_file.name}': {e}")
+                    logger.error(f"Error: Unhandled error for '{drive_file.name}': {e}")
                     results.append(FileScanResult(
                         file_id=drive_file.file_id,
                         file_name=drive_file.name,
                         file_path=drive_file.path,
+                        owner=drive_file.owner,
                         mime_type=drive_file.mime_type,
                         modified_time=drive_file.modified_time,
                         error=str(e),
@@ -365,6 +423,7 @@ def run_scan(args: argparse.Namespace) -> int:
 
     # Optional: Google Sheets upload
     if config.output.spreadsheet_id:
+        update_lock_status("SYNCING")
         write_to_sheets(
             results=results,
             spreadsheet_id=config.output.spreadsheet_id,
@@ -443,19 +502,28 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    print("\n" + "═" * 60)
-    print("  🔒 AI-Powered Security Scanner")
+    print("\n" + "=" * 60)
+    print("  [SECURE] AI-Powered Security Scanner")
     print("     Presidio + Google Drive + Korean PII")
-    print("═" * 60 + "\n")
+    print("=" * 60 + "\n")
 
-    exit_code = run_scan(args)
+    # Create lock file to signal "is_running" to the dashboard
+    lock_file_path = LOCK_FILE
+    try:
+        with open(lock_file_path, "w") as f:
+            f.write(f"{os.getpid()}:INDEXING:Initializing...")
+        
+        exit_code = run_scan(args)
+    finally:
+        if os.path.exists(lock_file_path):
+            os.remove(lock_file_path)
 
     if exit_code == 2:
-        print("\n⚠️  SCAN COMPLETE — PII DETECTED. Review the report.\n")
+        print("\n[!] SCAN COMPLETE - PII DETECTED. Review the report.\n")
     elif exit_code == 0:
-        print("\n✅ SCAN COMPLETE — No PII found.\n")
+        print("\n[OK] SCAN COMPLETE - No PII found.\n")
     else:
-        print("\n❌ SCAN FAILED. Check logs for details.\n")
+        print("\n[ERROR] SCAN FAILED. Check logs for details.\n")
 
     sys.exit(exit_code)
 

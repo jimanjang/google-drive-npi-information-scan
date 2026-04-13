@@ -36,6 +36,7 @@ class DriveFile:
     name: str
     mime_type: str
     path: str          # Full path within Drive (e.g., '/Folder/SubFolder/file.pdf')
+    owner: str = ""    # Primary owner's email
     size: int = 0      # bytes; 0 for Google native files
     modified_time: str = ""
     parents: List[str] = None
@@ -61,22 +62,15 @@ class DriveClient:
         self.rate_limiter = rate_limiter
         self._local = threading.local()
         self._creds = None
+        self._creds_map = {}            # email -> Credentials cache
         self._folder_cache: dict = {}   # folder_id → folder_name
 
     # ── Authentication ─────────────────────────────────────────────────────────
 
-    def authenticate(self) -> bool:
+    def authenticate(self, impersonate_email: Optional[str] = None) -> bool:
         """
         Perform OAuth 2.0 authentication with token caching.
-
-        Flow:
-          1. Load cached token from disk (if it exists)
-          2. Refresh expired token automatically
-          3. Launch browser OAuth flow for new authentication
-          4. Save token for future reuse
-
-        Returns:
-            True if authentication succeeded, False on failure.
+        Optionally impersonate a user if using a Service Account with DwD.
         """
         creds = None
         token_path = Path(self.auth_config.token_path)
@@ -88,9 +82,9 @@ class DriveClient:
                 creds = Credentials.from_authorized_user_file(
                     str(token_path), self.auth_config.scopes
                 )
-                logger.info("🔑 Loaded cached OAuth token")
+                logger.debug("Loaded cached OAuth token")
             except Exception as e:
-                logger.warning(f"⚠️  Cached token invalid: {e} — will re-authenticate")
+                logger.warning(f"Cached token invalid: {e} - will re-authenticate")
                 creds = None
 
         # Step 2: Refresh or re-authenticate
@@ -98,79 +92,129 @@ class DriveClient:
             if creds and creds.expired and creds.refresh_token:
                 try:
                     creds.refresh(Request())
-                    logger.info("🔄 OAuth token refreshed successfully")
+                    logger.debug("OAuth token refreshed successfully")
                 except Exception as e:
-                    logger.warning(f"⚠️  Token refresh failed: {e} — launching browser flow")
+                    logger.warning(f"Token refresh failed: {e} - launching browser flow")
                     creds = None
 
         # Build Drive service
         if not creds:
             if not creds_path.exists():
-                logger.error(
-                    f"❌ OAuth credentials not found: '{creds_path}'\n"
-                    "   👉 Download client_secret.json from:\n"
-                    "      Google Cloud Console → APIs & Services → Credentials\n"
-                    "      Then place it at: credentials/client_secret.json"
-                )
+                logger.error(f"Error: OAuth credentials not found: '{creds_path}'")
                 return False
 
-            # Detect credential type (Service Account vs Desktop OAuth)
             import json
             try:
                 with open(creds_path, 'r', encoding='utf-8') as f:
                     cred_data = json.load(f)
             except Exception as e:
-                logger.error(f"❌ Failed to read credentials JSON: {e}")
+                logger.error(f"Error: Failed to read credentials JSON: {e}")
                 return False
 
             if cred_data.get("type") == "service_account":
-                # Use Service Account without browser popup
                 from google.oauth2 import service_account
-                logger.info("🤖 Detected Service Account credentials. Authenticating directly...")
+                logger.info("Authenticating with Service Account...")
                 
-                # Filter out spreadsheets scope for DWD to prevent unauthorized_client error
-                drive_scopes = [s for s in self.auth_config.scopes if "spreadsheets" not in s]
-                
+                # Filter out spreadsheets scope for DWD to avoid unauthorized_client errors
+                # (Some scopes can't be combined with DwD if not authorized)
                 creds = service_account.Credentials.from_service_account_file(
-                    str(creds_path), scopes=drive_scopes
+                    str(creds_path), scopes=self.auth_config.scopes
                 )
                 
-                # Check for Domain-Wide Delegation target
-                if getattr(self.auth_config, "impersonate_user_email", None):
-                    logger.info(f"🎭 Using DWD to impersonate target user: {self.auth_config.impersonate_user_email}")
-                    creds = creds.with_subject(self.auth_config.impersonate_user_email)
-                    
-                logger.info("✅ Service Account authentication successful")
+                # Check for impersonation target
+                target_email = impersonate_email or self.auth_config.impersonate_user_email
+                if target_email:
+                    logger.info(f"Impersonating: {target_email}")
+                    creds = creds.with_subject(target_email)
             else:
-                # Step 3: Launch browser-based OAuth flow for normal accounts
-                logger.info("🌐 Opening browser for Google OAuth 2.0 authentication...")
-                flow = InstalledAppFlow.from_client_secrets_file(
+                # Browser-based flow
+                flow = InstalledAppFlow.from_client_secret_file(
                     str(creds_path), self.auth_config.scopes
                 )
-                creds = flow.run_local_server(
-                    port=0,
-                    prompt="consent",
-                    access_type="offline",
-                )
-                logger.info("✅ OAuth authentication successful")
-
-                # Step 4: Cache token for future runs (only for User OAuth)
+                creds = flow.run_local_server(port=0, prompt="consent", access_type="offline")
                 token_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(str(token_path), "w") as f:
                     f.write(creds.to_json())
-                logger.info(f"💾 Token cached at: {token_path}")
 
         self._creds = creds
-        logger.info("🚀 Google Drive credentials loaded (service built per-thread)")
+        if impersonate_email:
+            self._creds_map[impersonate_email] = creds
+        elif self.auth_config.impersonate_user_email:
+            self._creds_map[self.auth_config.impersonate_user_email] = creds
+            
+        logger.info(f"Google Drive credentials loaded{' for ' + impersonate_email if impersonate_email else ''}")
         return True
+
+    def get_service(self, email: Optional[str] = None):
+        """Get or build a thread-safe Drive service for a specific user identity."""
+        if not hasattr(self._local, "services"):
+            self._local.services = {}
+            
+        target_email = email or self.auth_config.impersonate_user_email or "default"
+        
+        if target_email not in self._local.services:
+            # Check creds cache
+            creds = self._creds_map.get(target_email)
+            if not creds:
+                # If not in cache, we must authenticate for this user
+                # Note: In parallel mode, we expect all users to be pre-authenticated during indexing,
+                # but we'll try a fresh auth if missing.
+                self.authenticate(impersonate_email=email if email != "default" else None)
+                creds = self._creds_map.get(target_email) or self._creds
+            
+            self._local.services[target_email] = build("drive", "v3", credentials=creds)
+            
+        return self._local.services[target_email]
+
+    def get_admin_service(self, email: Optional[str] = None):
+        """Get or build a thread-safe Admin service for a specific user identity."""
+        if not hasattr(self._local, "admin_services"):
+            self._local.admin_services = {}
+            
+        target_email = email or self.auth_config.impersonate_user_email or "default"
+        
+        if target_email not in self._local.admin_services:
+            creds = self._creds_map.get(target_email)
+            if not creds:
+                self.authenticate(impersonate_email=email if email != "default" else None)
+                creds = self._creds_map.get(target_email) or self._creds
+            
+            self._local.admin_services[target_email] = build("admin", "directory_v1", credentials=creds)
+            
+        return self._local.admin_services[target_email]
 
     @property
     def _service(self):
-        """Thread-safe property that builds a unique API client per thread."""
-        if not hasattr(self._local, "service"):
-            # google-api-python-client is NOT thread-safe, must build per thread
-            self._local.service = build("drive", "v3", credentials=self._creds)
-        return self._local.service
+        """Primary/default thread-safe Google Drive service."""
+        return self.get_service()
+
+    @property
+    def _admin_service(self):
+        """Primary/default thread-safe Google Admin service."""
+        return self.get_admin_service()
+
+    # ── Directory Operations ──────────────────────────────────────────────────
+
+    def list_all_users(self) -> List[str]:
+        """Fetch all active user emails in the domain."""
+        logger.info("Fetching domain users...")
+        users = []
+        try:
+            # We use the same service account with DwD (if applicable) info.
+            # Usually needs to impersonate a super admin to list all users, 
+            # or the service account must be granted Directory Read access.
+            request = self._admin_service.users().list(customer="my_customer", maxResults=500, orderBy="email")
+            while request:
+                response = request.execute()
+                for user in response.get("users", []):
+                    if not user.get("suspended", False) and not user.get("archived", False):
+                        users.append(user["primaryEmail"])
+                request = self._admin_service.users().list_next(request, response)
+            logger.info(f"Found {len(users)} active users.")
+            return users
+        except Exception as e:
+            logger.error(f"Error: Failed to fetch users: {e}")
+            return []
 
     # ── Folder Traversal ───────────────────────────────────────────────────────
 
@@ -192,7 +236,7 @@ class DriveClient:
         return name
 
     def _list_files_in_folder(
-        self, folder_id: str, folder_path: str, scan_config: ScanConfig
+        self, folder_id: str, folder_path: str, scan_config: ScanConfig, status_callback: Optional[callable] = None, state: Optional[dict] = None
     ) -> Generator[DriveFile, None, None]:
         """
         Recursively list all scannable files under a folder.
@@ -201,10 +245,16 @@ class DriveClient:
             folder_id:   Drive folder ID to search.
             folder_path: Human-readable path prefix for display.
             scan_config: Configuration with MIME types and folder scope.
+            status_callback: Optional fn(detail_str)
+            state: Optional dict to track global count: {'count': N}
 
         Yields:
             DriveFile instances for each discovered file.
         """
+        if status_callback:
+            current_count = state['count'] if state and 'count' in state else 0
+            status_callback(f"Found {current_count} files... Entering: {folder_path}")
+
         # Build MIME type filter (exclude Google folders themselves)
         mime_conditions = " or ".join(
             f"mimeType='{mt}'" for mt in scan_config.mime_types
@@ -223,14 +273,14 @@ class DriveClient:
                     self._service.files().list(
                         q=query,
                         pageSize=self.PAGE_SIZE,
-                        fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents)",
+                        fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, parents, owners)",
                         pageToken=page_token,
                         supportsAllDrives=True,
                         includeItemsFromAllDrives=True,
                     )
                 )
             except HttpError as e:
-                logger.error(f"❌ API error listing '{folder_path}': {e}")
+                logger.error(f"Error listing '{folder_path}': {e}")
                 break
 
             items = response.get("files", [])
@@ -240,17 +290,27 @@ class DriveClient:
 
                 if mime == "application/vnd.google-apps.folder":
                     # Recurse into subfolder
-                    logger.info(f"📁 Entering folder: {item_path}")
+                    logger.info(f"Entering folder: {item_path}")
                     yield from self._list_files_in_folder(
-                        item["id"], item_path, scan_config
+                        item["id"], item_path, scan_config, status_callback, state
                     )
                 else:
+                    owner_email = "Shared Drive / External"
+                    if item.get("owners"):
+                        owner_email = item["owners"][0].get("emailAddress", "Unknown")
+
                     # Yield scannable file
+                    if state:
+                        state['count'] += 1
+                        if status_callback and state['count'] % 20 == 0:
+                            status_callback(f"Found {state['count']} files... Current: {folder_path}")
+
                     yield DriveFile(
                         file_id=item["id"],
                         name=item["name"],
                         mime_type=mime,
                         path=item_path,
+                        owner=owner_email,
                         size=int(item.get("size", 0)),
                         modified_time=item.get("modifiedTime", ""),
                         parents=item.get("parents", []),
@@ -260,7 +320,7 @@ class DriveClient:
             if not page_token:
                 break
 
-    def list_files(self, scan_config: ScanConfig) -> List[DriveFile]:
+    def list_files(self, scan_config: ScanConfig, status_callback: Optional[callable] = None) -> List[DriveFile]:
         """
         List all scannable files under the configured folder.
 
@@ -269,10 +329,11 @@ class DriveClient:
         """
         folder_id = scan_config.folder_id
         folder_name = self._get_folder_name(folder_id)
-        logger.info(f"🔍 Scanning Drive folder: '{folder_name}' (id: {folder_id})")
+        logger.info(f"Scanning Drive folder: '{folder_name}' (id: {folder_id})")
 
-        files = list(self._list_files_in_folder(folder_id, f"/{folder_name}", scan_config))
-        logger.info(f"📋 Found {len(files)} scannable file(s)")
+        state = {'count': 0}
+        files = list(self._list_files_in_folder(folder_id, f"/{folder_name}", scan_config, status_callback, state))
+        logger.info(f"Found {len(files)} scannable file(s)")
         return files
 
     # ── File Download ──────────────────────────────────────────────────────────
@@ -288,36 +349,40 @@ class DriveClient:
             Raw bytes of file content, or None on error.
         """
         if self._service is None:
-            logger.error("❌ Not authenticated — call authenticate() first")
+            logger.error("Error: Not authenticated - call authenticate() first")
             return None
 
         self.rate_limiter.acquire()
 
         try:
+            # Ensure we use a service impersonated as the file owner
+            service = self.get_service(email=drive_file.owner)
+            
             if drive_file.mime_type in GOOGLE_NATIVE_TYPES:
-                return self._export_native_file(drive_file)
+                return self._export_native_file(drive_file, service)
             else:
-                return self._download_binary_file(drive_file)
+                return self._download_binary_file(drive_file, service)
         except HttpError as e:
-            status = e.resp.status
-            if status == 403:
-                logger.warning(f"🔒 No permission for: {drive_file.name}")
-            elif status == 404:
-                logger.warning(f"🔍 File not found: {drive_file.name}")
-            elif status == 429:
-                logger.warning(f"⏳ Rate limit hit for: {drive_file.name} — pausing 60s")
+            status_code = e.resp.status
+            if status_code == 403:
+                logger.warning(f"Permission denied for: {drive_file.name}")
+            elif status_code == 404:
+                logger.warning(f"File not found: {drive_file.name}")
+            elif status_code == 429:
+                logger.warning(f"Rate limit hit for: {drive_file.name} - pausing 60s")
                 time.sleep(60)
             else:
-                logger.error(f"❌ HTTP {status} downloading '{drive_file.name}': {e}")
+                logger.error(f"HTTP {status_code} downloading '{drive_file.name}': {e}")
             return None
         except Exception as e:
-            logger.error(f"❌ Unexpected error downloading '{drive_file.name}': {e}")
+            logger.error(f"Unexpected error downloading '{drive_file.name}': {e}")
             return None
 
-    def _download_binary_file(self, drive_file: DriveFile) -> Optional[bytes]:
+    def _download_binary_file(self, drive_file: DriveFile, service=None) -> Optional[bytes]:
         """Stream binary file download using MediaIoBaseDownload."""
+        target_service = service or self._service
         buffer = io.BytesIO()
-        request = self._service.files().get_media(
+        request = target_service.files().get_media(
             fileId=drive_file.file_id,
             supportsAllDrives=True,
         )
@@ -328,20 +393,22 @@ class DriveClient:
             _, done = downloader.next_chunk()
 
         content = buffer.getvalue()
-        logger.debug(f"  ⬇️  Downloaded {len(content):,} bytes: {drive_file.name}")
+        logger.debug(f"Downloaded {len(content):,} bytes: {drive_file.name}")
         return content
 
-    def _export_native_file(self, drive_file: DriveFile) -> Optional[bytes]:
+    def _export_native_file(self, drive_file: DriveFile, service=None) -> Optional[bytes]:
         """Export Google Docs/Sheets to text/CSV format."""
+        target_service = service or self._service
         export_mime = MIME_TYPE_MAP.get(drive_file.mime_type)
         if not export_mime:
             logger.warning(f"  No export MIME for: {drive_file.mime_type}")
             return None
 
         buffer = io.BytesIO()
-        request = self._service.files().export_media(
+        request = target_service.files().export_media(
             fileId=drive_file.file_id,
             mimeType=export_mime,
+            supportsAllDrives=True,
         )
         downloader = MediaIoBaseDownload(buffer, request)
         done = False
@@ -349,7 +416,7 @@ class DriveClient:
             _, done = downloader.next_chunk()
 
         content = buffer.getvalue()
-        logger.debug(f"  📤 Exported {drive_file.name} as {export_mime}: {len(content):,} bytes")
+        logger.debug(f"Exported {drive_file.name} as {export_mime}: {len(content):,} bytes")
         return content
 
     # ── API Retry Logic ────────────────────────────────────────────────────────
@@ -365,7 +432,7 @@ class DriveClient:
                     raise  # Don't retry permission/not found errors
                 if attempt < self.MAX_RETRIES - 1:
                     delay = self.RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"⏳ API HTTP error {e.resp.status} — retry {attempt+1} in {delay}s")
+                    logger.warning(f"API HTTP error {e.resp.status} - retry {attempt+1} in {delay}s")
                     time.sleep(delay)
                 else:
                     raise
@@ -373,7 +440,7 @@ class DriveClient:
                 # Catches WinError 10054 and other network rips
                 if attempt < self.MAX_RETRIES - 1:
                     delay = self.RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"🔌 Network Drop ({e}) — retry {attempt+1} in {delay}s")
+                    logger.warning(f"Network Drop ({e}) - retry {attempt+1} in {delay}s")
                     time.sleep(delay)
                 else:
                     raise

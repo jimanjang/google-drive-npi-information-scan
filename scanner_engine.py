@@ -41,6 +41,7 @@ class FileScanResult:
     file_id: str
     file_name: str
     file_path: str
+    owner: str
     mime_type: str
     modified_time: str
     total_chars: int = 0
@@ -147,20 +148,24 @@ class NativePatternMatcher:
          0.4, lambda m: validate_luhn(m)),
 
         # Korean RRN with hyphen: YYMMDD-GNNNNNC
+        # Korean RRN with hyphen: YYMMDD-GNNNNNC (Validated)
         ("KR_RRN",
          r"\b(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])[-\u2013]\s?[1-4]\d{6}\b",
          0.75, lambda m: validate_rrn_checksum("".join(c for c in m if c.isdigit()))),
 
-        # Korean RRN without hyphen
+        # Korean RRN without hyphen (Validated)
         ("KR_RRN",
          r"\b(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])[1-4]\d{6}\b",
          0.5, lambda m: validate_rrn_checksum(m)),
 
-        # Korean Passport (old: 1 letter + 8 digits)
-        ("KR_PASSPORT", r"\b[A-Z]\d{8}\b", 0.5, None),
+        # Weak Korean RRN (Format match only, for test data/suspicious patterns)
+        ("KR_RRN_WEAK",
+         r"\b(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])[-\u2013]\s?[1-4]\d{6}\b",
+         0.35, None),
 
-        # Korean Passport (new: 2 letters + 7 digits)
-        ("KR_PASSPORT", r"\b[A-Z]{2}\d{7}\b", 0.5, None),
+        # Korean Passport (More flexible for test data: 1-2 letters + 7-8 chars)
+        ("KR_PASSPORT", r"\b[A-Z][A-Z0-9]{8}\b", 0.45, None),
+        ("KR_PASSPORT", r"\b[A-Z]{2}[A-Z0-9]{7}\b", 0.45, None),
 
         # Korean Card (4-4-4-4 with hyphens/spaces)
         ("KR_CARD_NUMBER",
@@ -201,7 +206,7 @@ class NativePatternMatcher:
             (entity, re.compile(pattern, re.IGNORECASE), base_score, validator)
             for entity, pattern, base_score, validator in self.PATTERNS
         ]
-        logger.info(f"🔧 Native pattern engine: {len(self._compiled)} patterns loaded")
+        logger.info(f"Native pattern engine: {len(self._compiled)} patterns loaded")
 
     def _get_context(self, text: str, start: int, end: int, window: int = 50) -> str:
         """Extract surrounding context text for confidence boosting."""
@@ -345,14 +350,14 @@ class ScannerEngine:
         self._mode: str = "uninitialized"
 
     def initialize(self) -> None:
-        logger.info("🔧 Initializing PII Scanner Engine...")
+        logger.info("Initializing PII Scanner Engine...")
 
         # Try Presidio first
         presidio = PresidioEngine(self.config)
         if presidio.initialize():
             self._presidio = presidio
             self._mode = "presidio"
-            logger.info("✅ Mode: PRESIDIO + spaCy en_core_web_lg (full NER)")
+            logger.info("Mode: PRESIDIO + spaCy en_core_web_lg (full NER)")
         else:
             # Fallback to native patterns
             self._native = NativePatternMatcher(
@@ -360,7 +365,7 @@ class ScannerEngine:
             )
             self._mode = "native"
             logger.warning(
-                "⚠️  Mode: NATIVE PATTERN MATCHING\n"
+                "Mode: NATIVE PATTERN MATCHING\n"
                 "   spaCy/Presidio unavailable (requires Microsoft Visual C++ Redistributable).\n"
                 "   Detects: NPI, Email, Phone, SSN, Credit Cards, Korean PII (RRN, Passport, Card, Phone)\n"
                 "   Missing: PERSON names, LOCATION (requires spaCy NER)\n"
@@ -413,7 +418,7 @@ class ScannerEngine:
 
         chunks = chunk_text(text, self.config.chunk_size, self.config.chunk_overlap)
         logger.info(
-            f"  🔬 '{file_name}': {len(text):,} chars → "
+            f"  Analysis: '{file_name}': {len(text):,} chars -> "
             f"{len(chunks)} chunk(s) [{self._mode}]"
         )
 
@@ -438,10 +443,10 @@ class ScannerEngine:
             for f in deduped:
                 summary[f.entity_type] = summary.get(f.entity_type, 0) + 1
             logger.info(
-                f"  ⚠️  {len(deduped)} PII finding(s): "
-                + ", ".join(f"{t}×{c}" for t, c in summary.items())
+                f"  Findings: {len(deduped)} PII detected: "
+                + ", ".join(f"{t}x{c}" for t, c in summary.items())
             )
         else:
-            logger.info(f"  ✅ Clean: '{file_name}'")
+            logger.info(f"  Clean: '{file_name}'")
 
         return deduped

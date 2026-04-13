@@ -23,6 +23,9 @@ from scanner_engine import FileScanResult
 
 logger = logging.getLogger("scanner.sheets_reporter")
 
+# Limit the number of individual findings to prevent Google Sheets from hanging
+MAX_FINDINGS_PER_SHEET = 50000
+
 
 # ── Column Headers ─────────────────────────────────────────────────────────────
 
@@ -40,12 +43,6 @@ FLAGGED_HEADERS = [
     "LOCATION", "CREDIT_CARD", "US_SSN",
     "KR_RRN", "KR_PASSPORT", "KR_CARD_NUMBER", "KR_PHONE",
     "Modified Time",
-]
-
-FINDINGS_HEADERS = [
-    "File Name", "File Path", "Entity Type",
-    "Confidence", "Masked Value", "Start Index", "End Index",
-    "Risk Level",
 ]
 
 
@@ -202,37 +199,9 @@ def write_to_sheets(
                 es.get("KR_PHONE", 0),
                 result.modified_time,
             ])
-
         if flagged_rows:
             flagged_ws.append_rows(flagged_rows)
         logger.info(f"  ✅ Flagged Files tab: {len(flagged_rows)} row(s)")
-
-        # ── Tab 3: All Findings (Individual PII Instances) ────────────────────
-        findings_ws = _get_or_create_worksheet(
-            spreadsheet, f"{sheet_name} — All Findings", FINDINGS_HEADERS
-        )
-
-        finding_rows = []
-        for result in flagged_sorted:
-            for finding in result.findings:
-                finding_rows.append([
-                    result.file_name,
-                    result.file_path,
-                    finding.entity_type,
-                    finding.confidence,
-                    finding.masked_value,   # MASKED — never raw PII
-                    finding.start,
-                    finding.end,
-                    result.risk_level,
-                ])
-
-        if finding_rows:
-            # Write in batches of 1000 to avoid Sheets API limits
-            batch_size = 1000
-            for i in range(0, len(finding_rows), batch_size):
-                findings_ws.append_rows(finding_rows[i : i + batch_size])
-
-        logger.info(f"  ✅ All Findings tab: {len(finding_rows)} row(s)")
 
         # Apply conditional formatting colors by risk level (best-effort)
         try:
@@ -257,15 +226,10 @@ def _apply_risk_formatting(
     worksheet: gspread.Worksheet,
 ) -> None:
     """
-    Apply background color formatting to Risk Level column.
-    Colors: CRITICAL=red, HIGH=orange, MEDIUM=yellow, LOW=green.
-    Uses Sheets API batch update for efficiency.
+    Apply background color formatting to Risk Level column using Conditional Formatting Rules.
+    This is MUCH faster than per-cell formatting for large datasets.
     """
-    from googleapiclient.discovery import build
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-
-    # Risk color map (RGB 0-1 floats for Sheets API)
+    # Risk Color Map (RGB 0-1)
     risk_colors = {
         "CRITICAL": {"red": 0.96, "green": 0.26, "blue": 0.21},
         "HIGH":     {"red": 1.0,  "green": 0.60, "blue": 0.0},
@@ -273,35 +237,36 @@ def _apply_risk_formatting(
         "LOW":      {"red": 0.30, "green": 0.69, "blue": 0.31},
     }
 
-    # Risk Level is column index 4 (0-based) in FLAGGED_HEADERS
-    risk_col_index = 4
-
-    # Fetch Risk Level values from the sheet (skip header row)
-    values = worksheet.col_values(risk_col_index + 1)[1:]  # gspread is 1-indexed
-
+    # Identify the column index for "Risk Level" (column 4 for FLAGGED_HEADERS, column 7 for FINDINGS_HEADERS)
+    # We'll apply it to the specific worksheet based on its current headers if possible, 
+    # but for simplicity let's assume standard headers.
+    
     requests = []
-    for row_idx, risk_level in enumerate(values):
-        color = risk_colors.get(risk_level)
-        if color:
-            requests.append({
-                "repeatCell": {
-                    "range": {
+    
+    # Define rules for each risk level
+    for risk_level, color in risk_colors.items():
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
                         "sheetId": worksheet.id,
-                        "startRowIndex": row_idx + 1,  # skip header
-                        "endRowIndex": row_idx + 2,
-                        "startColumnIndex": risk_col_index,
-                        "endColumnIndex": risk_col_index + 1,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
+                        "startRowIndex": 1, # Skip header
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "TEXT_EQ",
+                            "values": [{"userEnteredValue": risk_level}]
+                        },
+                        "format": {
                             "backgroundColor": color,
-                            "textFormat": {"bold": True},
+                            "textFormat": {"bold": True}
                         }
-                    },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat)",
-                }
-            })
-
+                    }
+                },
+                "index": 0
+            }
+        })
+    
     if requests:
         spreadsheet.batch_update({"requests": requests})
-        logger.debug(f"  Applied color formatting to {len(requests)} row(s)")
+        logger.info(f"  ✅ Applied conditional formatting rules to '{worksheet.title}'")

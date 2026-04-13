@@ -14,7 +14,8 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 # ── Load .env ──────────────────────────────────────────────────────────────────
-load_dotenv()
+BASE_DIR = Path(__file__).parent.absolute()
+load_dotenv(BASE_DIR / ".env")
 
 # ── Logging Setup ──────────────────────────────────────────────────────────────
 LOG_FORMAT = "%(asctime)s │ %(levelname)-8s │ %(name)-20s │ %(message)s"
@@ -22,6 +23,14 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
 logger = logging.getLogger("scanner.config")
+
+def resolve_path(p: Optional[str], default: str) -> str:
+    """Force a path to be absolute relative to BASE_DIR if it's relative."""
+    raw_path = p or default
+    path = Path(raw_path)
+    if path.is_absolute():
+        return str(path)
+    return str(BASE_DIR / path)
 
 
 # ── Supported MIME Types ───────────────────────────────────────────────────────
@@ -61,18 +70,19 @@ DEFAULT_ENTITIES = [
 @dataclass
 class GoogleAuthConfig:
     """Google OAuth 2.0 authentication settings."""
-    oauth_credentials_path: str = os.getenv(
-        "GOOGLE_OAUTH_CREDENTIALS_PATH", "credentials/client_secret.json"
+    oauth_credentials_path: str = resolve_path(
+        os.getenv("GOOGLE_OAUTH_CREDENTIALS_PATH"), "credentials/client_secret.json"
     )
-    token_path: str = os.getenv(
-        "GOOGLE_TOKEN_PATH", "credentials/token.json"
+    token_path: str = resolve_path(
+        os.getenv("GOOGLE_TOKEN_PATH"), "credentials/token.json"
     )
     impersonate_user_email: Optional[str] = os.getenv(
         "IMPERSONATE_USER_EMAIL", None
     )
     scopes: List[str] = field(default_factory=lambda: [
         "https://www.googleapis.com/auth/drive.readonly",
-        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/admin.directory.user.readonly",
     ])
 
 
@@ -80,6 +90,7 @@ class GoogleAuthConfig:
 class ScanConfig:
     """Scan scope and processing settings."""
     folder_id: str = os.getenv("SCAN_FOLDER_ID", "root")
+    scan_all_users: bool = os.getenv("SCAN_ALL_USERS", "false").lower() == "true"
     max_workers: int = int(os.getenv("MAX_WORKERS", "4"))
     chunk_size: int = int(os.getenv("CHUNK_SIZE", "10000"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "200"))
@@ -98,7 +109,7 @@ class RateLimitConfig:
 @dataclass
 class OutputConfig:
     """Output and reporting settings."""
-    output_dir: str = os.getenv("OUTPUT_DIR", "reports")
+    output_dir: str = resolve_path(os.getenv("OUTPUT_DIR"), "reports")
     spreadsheet_id: Optional[str] = os.getenv("REPORT_SPREADSHEET_ID", None)
     sheet_name: str = os.getenv("REPORT_SHEET_NAME", "Security Scan Report")
 

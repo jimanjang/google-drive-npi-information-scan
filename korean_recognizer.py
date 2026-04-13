@@ -89,15 +89,29 @@ def get_korean_recognizers() -> list:
                                  supported_language="en")
 
             def validate_result(self, pattern_text: str) -> Optional[bool]:
+                # For Presidio, we'll keep the strict checksum but we could add a WeakRRN separately
                 return validate_rrn_checksum(pattern_text)
+
+        class KoreanWeakRRNRecognizer(PatternRecognizer):
+            CONTEXT_WORDS = ["주민등록번호", "주민번호", "rrn", "주민등록"]
+
+            def __init__(self):
+                patterns = [
+                    Pattern("kr_rrn_weak",
+                            r"\b(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])[-\u2013]\s?[1-4]\d{6}\b",
+                            0.35),
+                ]
+                super().__init__(supported_entity="KR_RRN_WEAK", patterns=patterns,
+                                 context=self.CONTEXT_WORDS, name="Korean_Weak_RRN_Recognizer",
+                                 supported_language="en")
 
         class KoreanPassportRecognizer(PatternRecognizer):
             CONTEXT_WORDS = ["여권", "여권번호", "passport", "passport number"]
 
             def __init__(self):
                 patterns = [
-                    Pattern("kr_passport_old", r"\b[A-Z]\d{8}\b", 0.4),
-                    Pattern("kr_passport_new", r"\b[A-Z]{2}\d{7}\b", 0.4),
+                    Pattern("kr_passport_flexible", r"\b[A-Za-z][A-Za-z0-9]{8}\b", 0.4),
+                    Pattern("kr_passport_flexible_new", r"\b[A-Za-z]{2}[A-Za-z0-9]{7}\b", 0.4),
                 ]
                 super().__init__(supported_entity="KR_PASSPORT", patterns=patterns,
                                  context=self.CONTEXT_WORDS, name="Korean_Passport_Recognizer",
@@ -134,6 +148,7 @@ def get_korean_recognizers() -> list:
 
         return [
             KoreanRRNRecognizer(),
+            KoreanWeakRRNRecognizer(),
             KoreanPassportRecognizer(),
             KoreanCardRecognizer(),
             KoreanPhoneRecognizer(),
